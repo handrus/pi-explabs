@@ -30,7 +30,11 @@ Templates:
 
 ### Added
 
+- Read the API key from pi's `auth.json` (`explabs` entry), supporting literals, `$ENV_VAR` references and `!command` secret lookups, with `EXPLABS_API_KEY` as a fallback
+
 ### Changed
+
+- `/login explabs` now points at `auth.json` and `EXPLABS_API_KEY`
 
 ### Fixed
 

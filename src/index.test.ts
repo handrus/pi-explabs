@@ -7,7 +7,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createExplabsExtension } from "./index.js";
 
+/** Credential `auth.json` returns for the `explabs` provider */
+const state = vi.hoisted(() => ({
+  credential: undefined as { type: string; key?: string } | undefined,
+  readCalls: [] as string[],
+}));
+
+// Stub the credential store lookup so tests never read the real ~/.pi/agent/auth.json
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  readStoredCredential: (providerId: string) => {
+    state.readCalls.push(providerId);
+    return providerId === "explabs" ? state.credential : undefined;
+  },
+}));
+
 const DEFAULT_BASE_URL = "https://api.experientiallabs.ai/v1";
+
+function storeApiKey(key: string) {
+  state.credential = { type: "api_key", key };
+}
 
 function mockFetch() {
   const fn = vi.fn();
@@ -56,6 +74,8 @@ beforeEach(() => {
     // Start every test from a clean slate
     delete process.env[name];
   }
+  state.credential = undefined;
+  state.readCalls = [];
 });
 
 afterEach(() => {
@@ -108,6 +128,84 @@ describe("createExplabsExtension", () => {
       );
     });
 
+    it("prefers the auth.json credential over EXPLABS_API_KEY", () => {
+      storeApiKey("xpl_from_auth");
+      process.env.EXPLABS_API_KEY = "xpl_from_env";
+      const pi = mockPi();
+      createExplabsExtension()(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "xpl_from_auth" }),
+      );
+    });
+
+    it("reads the credential for the 'explabs' provider", () => {
+      storeApiKey("xpl_from_auth");
+      createExplabsExtension()(mockPi() as never);
+
+      expect(state.readCalls).toContain("explabs");
+    });
+
+    it("passes an auth.json !command to pi unresolved", () => {
+      storeApiKey("!security find-generic-password -ws 'explabs'");
+      const pi = mockPi();
+      createExplabsExtension()(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "!security find-generic-password -ws 'explabs'" }),
+      );
+    });
+
+    it("ignores a non api_key credential", () => {
+      state.credential = { type: "oauth" };
+      process.env.EXPLABS_API_KEY = "xpl_from_env";
+      const pi = mockPi();
+      createExplabsExtension()(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "xpl_from_env" }),
+      );
+    });
+
+    it("config param apiKey overrides all sources", () => {
+      storeApiKey("xpl_from_auth");
+      process.env.EXPLABS_API_KEY = "xpl_from_env";
+      const pi = mockPi();
+      createExplabsExtension({ apiKey: "xpl_from_config" })(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "xpl_from_config" }),
+      );
+    });
+
+    it("config param apiKeyEnv only changes the env var fallback", () => {
+      storeApiKey("xpl_from_auth");
+      process.env.MY_CUSTOM_KEY = "custom_key_value";
+      const pi = mockPi();
+      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "xpl_from_auth" }),
+      );
+      expect(state.readCalls).toContain("explabs");
+    });
+
+    it("config param apiKeyEnv is used when auth.json has no entry", () => {
+      process.env.MY_CUSTOM_KEY = "custom_key_value";
+      const pi = mockPi();
+      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
+
+      expect(pi.registerProvider).toHaveBeenCalledWith(
+        "explabs",
+        expect.objectContaining({ apiKey: "custom_key_value" }),
+      );
+    });
+
     it("reads EXPLABS_BASE_URL env var", () => {
       process.env.EXPLABS_BASE_URL = "https://selfhosted.example.com/v1";
       const pi = mockPi();
@@ -156,17 +254,6 @@ describe("createExplabsExtension", () => {
       );
     });
 
-    it("config param apiKeyEnv selects a custom env var", () => {
-      process.env.MY_CUSTOM_KEY = "custom_key_value";
-      const pi = mockPi();
-      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
-
-      expect(pi.registerProvider).toHaveBeenCalledWith(
-        "explabs",
-        expect.objectContaining({ apiKey: "custom_key_value" }),
-      );
-    });
-
     it("throws on invalid apiFormat in config", () => {
       // @ts-expect-error – testing invalid value at runtime
       expect(() => createExplabsExtension({ apiFormat: "bogus-format" })).toThrow(
@@ -210,6 +297,7 @@ describe("extension function", () => {
       const result = await handler!({ text: "/login explabs" }, ctx);
 
       expect(result).toEqual({ action: "handled" });
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("auth.json"), "info");
       expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("API key"), "info");
     });
 
@@ -268,6 +356,60 @@ describe("refreshModels", () => {
         }),
       }),
     );
+  });
+
+  it("sends the Authorization header from the auth.json credential", async () => {
+    fetch = mockFetch();
+    pi = mockPi();
+    storeApiKey("xpl_from_auth");
+    createExplabsExtension()(pi as never);
+    provider = pi.registerProvider.mock.calls[0][1];
+
+    fetch.mockResolvedValue(mockResponse({ data: [] }));
+
+    await provider.refreshModels({ signal: new AbortController().signal });
+
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer xpl_from_auth" }),
+      }),
+    );
+  });
+
+  it("resolves an auth.json !command for the Authorization header", async () => {
+    fetch = mockFetch();
+    pi = mockPi();
+    storeApiKey("!printf 'xpl_from_secret_manager\\n'");
+    createExplabsExtension()(pi as never);
+    provider = pi.registerProvider.mock.calls[0][1];
+
+    fetch.mockResolvedValue(mockResponse({ data: [] }));
+
+    await provider.refreshModels({ signal: new AbortController().signal });
+
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer xpl_from_secret_manager" }),
+      }),
+    );
+  });
+
+  it("resolves the api key only once per registration", async () => {
+    fetch = mockFetch();
+    pi = mockPi();
+    storeApiKey("!echo xpl_counted");
+    createExplabsExtension()(pi as never);
+    provider = pi.registerProvider.mock.calls[0][1];
+
+    fetch.mockImplementation(async () => mockResponse({ data: [] }));
+
+    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels({ signal: new AbortController().signal });
+
+    const headers = fetch.mock.calls.map(([, init]) => init.headers.Authorization);
+    expect(headers).toEqual(["Bearer xpl_counted", "Bearer xpl_counted"]);
   });
 
   it("passes the abort signal", async () => {
