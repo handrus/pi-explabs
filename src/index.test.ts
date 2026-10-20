@@ -7,25 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createExplabsExtension } from "./index.js";
 
-/** Credential `auth.json` returns for the `explabs` provider */
-const state = vi.hoisted(() => ({
-  credential: undefined as { type: string; key?: string } | undefined,
-  readCalls: [] as string[],
-}));
-
-// Stub the credential store lookup so tests never read the real ~/.pi/agent/auth.json
-vi.mock("@earendil-works/pi-coding-agent", () => ({
-  readStoredCredential: (providerId: string) => {
-    state.readCalls.push(providerId);
-    return providerId === "explabs" ? state.credential : undefined;
-  },
-}));
-
 const DEFAULT_BASE_URL = "https://api.experientiallabs.ai/v1";
-
-function storeApiKey(key: string) {
-  state.credential = { type: "api_key", key };
-}
 
 function mockFetch() {
   const fn = vi.fn();
@@ -59,6 +41,20 @@ function mockCtx() {
   return { ui: { notify: vi.fn() } };
 }
 
+/**
+ * RefreshModelsContext stand-in. pi resolves the effective credential itself
+ * (auth.json first, configured apiKey as fallback) and passes it here.
+ */
+function refreshContext(overrides?: Record<string, unknown>) {
+  return {
+    signal: new AbortController().signal,
+    allowNetwork: true,
+    credential: { type: "api_key", key: "xpl_test_key" },
+    publish: async () => true,
+    ...overrides,
+  };
+}
+
 const ENV_VARS = [
   "EXPLABS_API_KEY",
   "EXPLABS_BASE_URL",
@@ -74,8 +70,6 @@ beforeEach(() => {
     // Start every test from a clean slate
     delete process.env[name];
   }
-  state.credential = undefined;
-  state.readCalls = [];
 });
 
 afterEach(() => {
@@ -108,73 +102,31 @@ describe("createExplabsExtension", () => {
         "explabs",
         expect.objectContaining({
           baseUrl: DEFAULT_BASE_URL,
-          apiKey: "",
+          apiKey: "$EXPLABS_API_KEY",
           authHeader: true,
           api: "openai-completions",
         }),
       );
     });
 
-    it("reads EXPLABS_API_KEY env var", () => {
+    it("registers a $VAR reference instead of reading EXPLABS_API_KEY at startup", () => {
+      // pi resolves the reference at request time, preferring a stored auth.json
+      // credential — the extension never touches the key itself.
       process.env.EXPLABS_API_KEY = "xpl_abc123def456abc123def456abc123def456";
       const pi = mockPi();
       createExplabsExtension()(pi as never);
 
       expect(pi.registerProvider).toHaveBeenCalledWith(
         "explabs",
-        expect.objectContaining({
-          apiKey: "xpl_abc123def456abc123def456abc123def456",
-        }),
+        expect.objectContaining({ apiKey: "$EXPLABS_API_KEY" }),
       );
     });
 
-    it("prefers the auth.json credential over EXPLABS_API_KEY", () => {
-      storeApiKey("xpl_from_auth");
-      process.env.EXPLABS_API_KEY = "xpl_from_env";
+    it("config param apiKey wins over apiKeyEnv", () => {
       const pi = mockPi();
-      createExplabsExtension()(pi as never);
-
-      expect(pi.registerProvider).toHaveBeenCalledWith(
-        "explabs",
-        expect.objectContaining({ apiKey: "xpl_from_auth" }),
+      createExplabsExtension({ apiKey: "xpl_from_config", apiKeyEnv: "MY_CUSTOM_KEY" })(
+        pi as never,
       );
-    });
-
-    it("reads the credential for the 'explabs' provider", () => {
-      storeApiKey("xpl_from_auth");
-      createExplabsExtension()(mockPi() as never);
-
-      expect(state.readCalls).toContain("explabs");
-    });
-
-    it("passes an auth.json !command to pi unresolved", () => {
-      storeApiKey("!security find-generic-password -ws 'explabs'");
-      const pi = mockPi();
-      createExplabsExtension()(pi as never);
-
-      expect(pi.registerProvider).toHaveBeenCalledWith(
-        "explabs",
-        expect.objectContaining({ apiKey: "!security find-generic-password -ws 'explabs'" }),
-      );
-    });
-
-    it("ignores a non api_key credential", () => {
-      state.credential = { type: "oauth" };
-      process.env.EXPLABS_API_KEY = "xpl_from_env";
-      const pi = mockPi();
-      createExplabsExtension()(pi as never);
-
-      expect(pi.registerProvider).toHaveBeenCalledWith(
-        "explabs",
-        expect.objectContaining({ apiKey: "xpl_from_env" }),
-      );
-    });
-
-    it("config param apiKey overrides all sources", () => {
-      storeApiKey("xpl_from_auth");
-      process.env.EXPLABS_API_KEY = "xpl_from_env";
-      const pi = mockPi();
-      createExplabsExtension({ apiKey: "xpl_from_config" })(pi as never);
 
       expect(pi.registerProvider).toHaveBeenCalledWith(
         "explabs",
@@ -182,27 +134,26 @@ describe("createExplabsExtension", () => {
       );
     });
 
-    it("config param apiKeyEnv only changes the env var fallback", () => {
-      storeApiKey("xpl_from_auth");
-      process.env.MY_CUSTOM_KEY = "custom_key_value";
+    it("config param apiKey passes a !command through unresolved", () => {
       const pi = mockPi();
-      createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
+      createExplabsExtension({ apiKey: "!security find-generic-password -ws explabs" })(
+        pi as never,
+      );
 
       expect(pi.registerProvider).toHaveBeenCalledWith(
         "explabs",
-        expect.objectContaining({ apiKey: "xpl_from_auth" }),
+        expect.objectContaining({ apiKey: "!security find-generic-password -ws explabs" }),
       );
-      expect(state.readCalls).toContain("explabs");
     });
 
-    it("config param apiKeyEnv is used when auth.json has no entry", () => {
+    it("config param apiKeyEnv names the fallback reference", () => {
       process.env.MY_CUSTOM_KEY = "custom_key_value";
       const pi = mockPi();
       createExplabsExtension({ apiKeyEnv: "MY_CUSTOM_KEY" })(pi as never);
 
       expect(pi.registerProvider).toHaveBeenCalledWith(
         "explabs",
-        expect.objectContaining({ apiKey: "custom_key_value" }),
+        expect.objectContaining({ apiKey: "$MY_CUSTOM_KEY" }),
       );
     });
 
@@ -334,7 +285,7 @@ describe("refreshModels", () => {
   it("fetches from {baseUrl}/models", async () => {
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels(refreshContext());
 
     expect(fetch).toHaveBeenCalledWith(
       `${DEFAULT_BASE_URL}/models`,
@@ -342,11 +293,12 @@ describe("refreshModels", () => {
     );
   });
 
-  it("sends the Authorization header", async () => {
-    process.env.EXPLABS_API_KEY = "xpl_my_test_key";
+  it("sends the Authorization header from the credential pi resolved", async () => {
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels(
+      refreshContext({ credential: { type: "api_key", key: "xpl_my_test_key" } }),
+    );
 
     expect(fetch).toHaveBeenCalledWith(
       expect.any(String),
@@ -358,16 +310,13 @@ describe("refreshModels", () => {
     );
   });
 
-  it("sends the Authorization header from the auth.json credential", async () => {
-    fetch = mockFetch();
-    pi = mockPi();
-    storeApiKey("xpl_from_auth");
-    createExplabsExtension()(pi as never);
-    provider = pi.registerProvider.mock.calls[0][1];
-
+  it("uses pi's stored credential even when EXPLABS_API_KEY differs", async () => {
+    process.env.EXPLABS_API_KEY = "xpl_from_env";
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal: new AbortController().signal });
+    await provider.refreshModels(
+      refreshContext({ credential: { type: "api_key", key: "xpl_from_auth" } }),
+    );
 
     expect(fetch).toHaveBeenCalledWith(
       expect.any(String),
@@ -377,46 +326,34 @@ describe("refreshModels", () => {
     );
   });
 
-  it("resolves an auth.json !command for the Authorization header", async () => {
-    fetch = mockFetch();
-    pi = mockPi();
-    storeApiKey("!printf 'xpl_from_secret_manager\\n'");
-    createExplabsExtension()(pi as never);
-    provider = pi.registerProvider.mock.calls[0][1];
+  it("does not fetch during the cache-restore pass (allowNetwork=false)", async () => {
+    const models = await provider.refreshModels(refreshContext({ allowNetwork: false }));
 
-    fetch.mockResolvedValue(mockResponse({ data: [] }));
-
-    await provider.refreshModels({ signal: new AbortController().signal });
-
-    expect(fetch).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: "Bearer xpl_from_secret_manager" }),
-      }),
-    );
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("resolves the api key only once per registration", async () => {
-    fetch = mockFetch();
-    pi = mockPi();
-    storeApiKey("!echo xpl_counted");
-    createExplabsExtension()(pi as never);
-    provider = pi.registerProvider.mock.calls[0][1];
+  it("does not fetch when pi resolved no credential", async () => {
+    const models = await provider.refreshModels(refreshContext({ credential: undefined }));
 
-    fetch.mockImplementation(async () => mockResponse({ data: [] }));
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
 
-    await provider.refreshModels({ signal: new AbortController().signal });
-    await provider.refreshModels({ signal: new AbortController().signal });
+  it("does not fetch for a non api_key credential", async () => {
+    const models = await provider.refreshModels(
+      refreshContext({ credential: { type: "oauth", access: "token" } }),
+    );
 
-    const headers = fetch.mock.calls.map(([, init]) => init.headers.Authorization);
-    expect(headers).toEqual(["Bearer xpl_counted", "Bearer xpl_counted"]);
+    expect(models).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("passes the abort signal", async () => {
     const signal = new AbortController().signal;
     fetch.mockResolvedValue(mockResponse({ data: [] }));
 
-    await provider.refreshModels({ signal });
+    await provider.refreshModels(refreshContext({ signal }));
 
     expect(fetch).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal }));
   });
@@ -428,9 +365,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models).toEqual([
       {
@@ -459,9 +394,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models[0].name).toBe("Aion 2.0");
   });
@@ -480,9 +413,7 @@ describe("refreshModels", () => {
       }),
     );
 
-    const models = await provider.refreshModels({
-      signal: new AbortController().signal,
-    });
+    const models = await provider.refreshModels(refreshContext());
 
     expect(models[0]).toMatchObject({
       contextWindow: 200_000,
@@ -508,7 +439,7 @@ describe("refreshModels", () => {
       ),
     );
 
-    await expect(provider.refreshModels({ signal: new AbortController().signal })).rejects.toThrow(
+    await expect(provider.refreshModels(refreshContext())).rejects.toThrow(
       /Failed to fetch Experiential Labs models/,
     );
   });
@@ -516,7 +447,7 @@ describe("refreshModels", () => {
   it("throws when response body lacks data array", async () => {
     fetch.mockResolvedValue(mockResponse({ error: "not found" }));
 
-    await expect(provider.refreshModels({ signal: new AbortController().signal })).rejects.toThrow(
+    await expect(provider.refreshModels(refreshContext())).rejects.toThrow(
       /Invalid response format/,
     );
   });

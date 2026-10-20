@@ -35,6 +35,7 @@ Templates:
 ### Changed
 
 - `/login explabs` now points at `auth.json` and `EXPLABS_API_KEY`
+- The `/models` fetch now uses the credential pi resolved, runs once per refresh (it used to run twice), and is skipped when pi refreshes offline or no API key is configured
 
 ### Fixed
 

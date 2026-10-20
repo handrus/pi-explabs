@@ -9,7 +9,6 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import Debug from "debug";
-import { PROVIDER_ID, resolveApiKey } from "./api-key.js";
 
 const debug = Debug("pi-explabs");
 
@@ -27,15 +26,17 @@ const API_FORMATS: readonly ApiFormat[] = [
 interface ExperientialLabsConfig {
   /** Base URL for the API (default: reads from EXPLABS_BASE_URL env var, falls back to https://api.experientiallabs.ai/v1) */
   baseUrl?: string;
-  /** API key literal, env interpolation ($ENV_VAR), or leading !command. Overrides every other source. */
+  /**
+   * API key literal, `$ENV_VAR` reference, or leading `!command`, registered with pi
+   * unresolved. Used only when `auth.json` has no `explabs` entry — a stored credential
+   * always wins, matching pi's own precedence.
+   */
   apiKey?: string;
   /**
-   * Environment variable name for the API key (default: EXPLABS_API_KEY).
-   * Only used when `auth.json` has no `explabs` entry.
+   * Environment variable name for the API key fallback (default: EXPLABS_API_KEY).
+   * Registered as a `$VAR` reference that pi resolves at request time.
    */
   apiKeyEnv?: string;
-  /** Path to pi's auth.json (default: pi's agent dir auth.json) */
-  authPath?: string;
   /** API format to use (default: reads from EXPLABS_API_FORMAT env var, falls back to openai-completions) */
   apiFormat?: ApiFormat;
 }
@@ -113,34 +114,17 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
   const apiKeyEnv = config?.apiKeyEnv ?? DEFAULT_CONFIG.apiKeyEnv;
   const apiFormat = resolveApiFormat(config?.apiFormat);
 
-  // Unresolved value: pi resolves literals, $ENV_VAR references and !commands itself
-  const credential = resolveApiKey({
-    apiKey: config?.apiKey,
-    apiKeyEnv: config?.apiKeyEnv,
-    authPath: config?.authPath,
-    resolve: false,
-  });
-
-  // Resolved value for our own /models fetch, computed on first use and cached
-  let resolvedApiKey: string | undefined;
-
-  function getApiKey(): string {
-    if (resolvedApiKey === undefined) {
-      resolvedApiKey = resolveApiKey({
-        apiKey: config?.apiKey,
-        apiKeyEnv: config?.apiKeyEnv,
-        authPath: config?.authPath,
-      }).value;
-    }
-    return resolvedApiKey;
-  }
+  // What pi should use when auth.json has no `explabs` credential: an explicit key
+  // wins over the environment reference. The value stays unresolved — pi resolves
+  // $VAR / !command / literals itself and always prefers a stored credential, so the
+  // extension never reads or resolves the key on its own.
+  const apiKey = config?.apiKey || `$${apiKeyEnv}`;
 
   debug(
-    "config: baseUrl=%s apiKeyEnv=%s apiFormat=%s apiKeySource=%s",
+    "config: baseUrl=%s apiFormat=%s apiKey=%s",
     baseUrl,
-    apiKeyEnv,
     apiFormat,
-    credential.source,
+    config?.apiKey ? "config" : `env:${apiKeyEnv}`,
   );
 
   return function explabsExtension(pi: ExtensionAPI): void {
@@ -159,14 +143,29 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
       return { action: "continue" };
     });
 
-    pi.registerProvider(PROVIDER_ID, {
+    pi.registerProvider("explabs", {
       name: "Experiential Labs",
       baseUrl,
-      apiKey: credential.value,
+      apiKey,
       authHeader: true,
       api: apiFormat,
 
-      async refreshModels({ signal }: { signal: AbortSignal }) {
+      async refreshModels(context) {
+        const { signal, credential, allowNetwork } = context;
+
+        // pi refreshes in two passes: a cache-restore pass before auth is resolved
+        // (allowNetwork=false), then the network pass carrying the effective
+        // credential — stored auth.json entry first, configured apiKey as fallback.
+        if (!allowNetwork) {
+          return [];
+        }
+
+        const key = credential?.type === "api_key" ? credential.key : undefined;
+        if (!key) {
+          debug("pi resolved no API key, skipping model fetch");
+          return [];
+        }
+
         const modelsUrl = `${baseUrl}/models`;
         debug("fetching models from %s", modelsUrl);
 
@@ -174,7 +173,7 @@ export function createExplabsExtension(config?: ExperientialLabsConfig) {
           signal,
           headers: {
             Accept: "application/json",
-            Authorization: `Bearer ${getApiKey()}`,
+            Authorization: `Bearer ${key}`,
           },
         });
 
